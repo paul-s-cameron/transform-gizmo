@@ -1,5 +1,5 @@
 use bevy_app::{App, Plugin};
-use bevy_asset::{Asset, AssetId, Handle, load_internal_asset, weak_handle};
+use bevy_asset::{Asset, AssetId, Handle, RenderAssetUsages, load_internal_asset, uuid_handle};
 use bevy_core_pipeline::core_3d::{CORE_3D_DEPTH_FORMAT, Transparent3d};
 use bevy_core_pipeline::prepass::{
     DeferredPrepass, DepthPrepass, MotionVectorPrepass, NormalPrepass,
@@ -10,15 +10,14 @@ use bevy_ecs::query::ROQueryItem;
 use bevy_ecs::system::SystemParamItem;
 use bevy_ecs::system::lifetimeless::{Read, SRes};
 use bevy_image::BevyDefault as _;
+use bevy_mesh::VertexBufferLayout;
 use bevy_pbr::{MeshPipeline, MeshPipelineKey, SetMeshViewBindGroup};
-use bevy_platform::collections::{HashMap, HashSet};
+use bevy_platform::collections::HashMap;
 use bevy_reflect::{Reflect, TypePath};
 use bevy_render::extract_component::ExtractComponent;
-use bevy_render::mesh::PrimitiveTopology;
 use bevy_render::prelude::*;
 use bevy_render::render_asset::{
-    PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssetUsages, RenderAssets,
-    prepare_assets,
+    PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets, prepare_assets,
 };
 use bevy_render::render_phase::{
     AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
@@ -27,20 +26,21 @@ use bevy_render::render_phase::{
 use bevy_render::render_resource::{
     BlendState, Buffer, BufferInitDescriptor, BufferUsages, ColorTargetState, ColorWrites,
     CompareFunction, DepthBiasState, DepthStencilState, FragmentState, IndexFormat,
-    MultisampleState, PipelineCache, PrimitiveState, RenderPipelineDescriptor,
+    MultisampleState, PipelineCache, PrimitiveState, PrimitiveTopology, RenderPipelineDescriptor,
     SpecializedRenderPipeline, SpecializedRenderPipelines, StencilState, TextureFormat,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+    VertexAttribute, VertexFormat, VertexState, VertexStepMode,
 };
 use bevy_render::renderer::RenderDevice;
-use bevy_render::sync_world::TemporaryRenderEntity;
-use bevy_render::view::{ExtractedView, RenderLayers, ViewTarget};
-use bevy_render::{Extract, Render, RenderApp, RenderSet};
+use bevy_render::sync_world::{MainEntity, TemporaryRenderEntity};
+use bevy_render::view::{ExtractedView, ViewTarget};
+use bevy_render::{Extract, Render, RenderApp, RenderSystems};
+use bevy_shader::Shader;
 use bytemuck::cast_slice;
 use uuid::Uuid;
 
 use crate::GizmoCamera;
 
-const GIZMO_SHADER_HANDLE: Handle<Shader> = weak_handle!("e44be110-cb2b-4a8d-9c0c-965424e6a633");
+const GIZMO_SHADER_HANDLE: Handle<Shader> = uuid_handle!("e44be110-cb2b-4a8d-9c0c-965424e6a633");
 
 pub(crate) struct TransformGizmoRenderPlugin;
 
@@ -62,7 +62,7 @@ impl Plugin for TransformGizmoRenderPlugin {
             .add_systems(
                 Render,
                 queue_transform_gizmos
-                    .in_set(RenderSet::Queue)
+                    .in_set(RenderSystems::Queue)
                     .after(prepare_assets::<GizmoBuffers>),
             );
     }
@@ -108,14 +108,8 @@ impl From<&GizmoDrawDataHandle> for AssetId<GizmoDrawData> {
 }
 
 fn extract_gizmo_data(mut commands: Commands, handles: Extract<Res<DrawDataHandles>>) {
-    let handle_weak_refs = handles
-        .handles
-        .values()
-        .map(|handle| handle.clone_weak())
-        .collect::<HashSet<_>>();
-
-    for handle in handle_weak_refs {
-        commands.spawn((GizmoDrawDataHandle(handle), TemporaryRenderEntity));
+    for handle in handles.handles.values() {
+        commands.spawn((GizmoDrawDataHandle(handle.0.clone()), TemporaryRenderEntity));
     }
 }
 
@@ -142,6 +136,7 @@ impl RenderAsset for GizmoBuffers {
         source_asset: Self::SourceAsset,
         _: AssetId<Self::SourceAsset>,
         render_device: &mut SystemParamItem<Self::Param>,
+        _previous_asset: Option<&Self>,
     ) -> std::result::Result<Self, PrepareAssetError<Self::SourceAsset>> {
         let position_buffer_data = cast_slice(&source_asset.0.vertices);
         let position_buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -183,8 +178,8 @@ impl<P: PhaseItem> RenderCommand<P> for DrawTransformGizmo {
     #[inline]
     fn render<'w>(
         _item: &P,
-        _view: ROQueryItem<'w, Self::ViewQuery>,
-        handle: Option<ROQueryItem<'w, Self::ItemQuery>>,
+        _view: ROQueryItem<'w, 'w, Self::ViewQuery>,
+        handle: Option<ROQueryItem<'w, 'w, Self::ItemQuery>>,
         gizmos: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
@@ -197,7 +192,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawTransformGizmo {
         };
 
         if gizmo.index_buffer.size() > 0 {
-            pass.set_index_buffer(gizmo.index_buffer.slice(..), 0, IndexFormat::Uint32);
+            pass.set_index_buffer(gizmo.index_buffer.slice(..), IndexFormat::Uint32);
             pass.set_vertex_buffer(0, gizmo.position_buffer.slice(..));
             pass.set_vertex_buffer(1, gizmo.color_buffer.slice(..));
 
@@ -247,17 +242,14 @@ impl SpecializedRenderPipeline for TransformGizmoPipeline {
             TextureFormat::bevy_default()
         };
 
-        let view_layout = self
-            .mesh_pipeline
-            .get_view_layout(key.view_key.into())
-            .clone();
+        let view_layout = self.mesh_pipeline.get_view_layout(key.view_key.into());
 
         RenderPipelineDescriptor {
             label: Some("TransformGizmo Pipeline".into()),
             zero_initialize_workgroup_memory: true, // ?
             vertex: VertexState {
                 shader: GIZMO_SHADER_HANDLE,
-                entry_point: "vertex".into(),
+                entry_point: Some("vertex".into()),
                 shader_defs: shader_defs.clone(),
                 buffers: vec![
                     VertexBufferLayout {
@@ -283,14 +275,14 @@ impl SpecializedRenderPipeline for TransformGizmoPipeline {
             fragment: Some(FragmentState {
                 shader: GIZMO_SHADER_HANDLE,
                 shader_defs,
-                entry_point: "fragment".into(),
+                entry_point: Some("fragment".into()),
                 targets: vec![Some(ColorTargetState {
                     format,
                     blend: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                     write_mask: ColorWrites::ALL,
                 })],
             }),
-            layout: vec![view_layout],
+            layout: vec![view_layout.main_layout.clone()],
             primitive: PrimitiveState {
                 topology: PrimitiveTopology::TriangleList,
                 cull_mode: None,
@@ -328,7 +320,6 @@ fn queue_transform_gizmos(
         Entity,
         &ExtractedView,
         Option<&Msaa>,
-        Option<&RenderLayers>,
         (
             Has<NormalPrepass>,
             Has<DepthPrepass>,
@@ -344,7 +335,6 @@ fn queue_transform_gizmos(
         view_entity,
         view,
         entity_msaa,
-        _render_layers,
         (normal_prepass, depth_prepass, motion_vector_prepass, deferred_prepass),
     ) in &mut views
     {
@@ -354,7 +344,7 @@ fn queue_transform_gizmos(
         };
 
         // entity_msaa > camera_msaa > default
-        let msaa_sample_count = entity_msaa.map_or(
+        let msaa_sample_count: u32 = entity_msaa.map_or(
             camera_msaa.unwrap_or(&Msaa::default()).samples(),
             Msaa::samples,
         );
@@ -393,7 +383,7 @@ fn queue_transform_gizmos(
             );
 
             transparent_phase.add(Transparent3d {
-                entity: (entity, view_entity.into()),
+                entity: (entity, MainEntity::from(view_entity)),
                 draw_function,
                 pipeline,
                 distance: 0.,

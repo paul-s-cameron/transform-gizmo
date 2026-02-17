@@ -30,12 +30,12 @@
 
 use bevy_app::prelude::*;
 use bevy_asset::{AssetApp, Assets};
+use bevy_camera::Camera;
 use bevy_ecs::prelude::*;
 use bevy_input::prelude::*;
 use bevy_math::{DQuat, DVec3, Vec2};
 use bevy_picking::hover::HoverMap;
 use bevy_platform::collections::HashMap;
-use bevy_render::prelude::*;
 use bevy_transform::prelude::*;
 use bevy_window::{PrimaryWindow, Window};
 use mouse_interact::MouseGizmoInteractionPlugin;
@@ -72,8 +72,8 @@ impl Plugin for TransformGizmoPlugin {
         app.init_asset::<render::GizmoDrawData>()
             .init_resource::<GizmoOptions>()
             .init_resource::<GizmoStorage>()
-            .add_event::<GizmoDragStarted>()
-            .add_event::<GizmoDragging>()
+            .add_message::<GizmoDragStarted>()
+            .add_message::<GizmoDragging>()
             .add_plugins(TransformGizmoRenderPlugin)
             .add_systems(
                 Last,
@@ -371,18 +371,47 @@ fn handle_hotkeys(
     }
 }
 
-#[derive(Debug, Event, Default)]
+#[derive(Debug, Message, Default)]
 pub struct GizmoDragStarted;
-#[derive(Debug, Event, Default)]
+#[derive(Debug, Message, Default)]
 pub struct GizmoDragging;
+
+/// Converts a world-space transform back to local space relative to the parent.
+/// If the entity has no parent, the world-space transform is returned as-is.
+fn world_to_local(
+    world_transform: Transform,
+    child_of: Option<&ChildOf>,
+    q_parent_global: &Query<&GlobalTransform>,
+) -> Transform {
+    match child_of {
+        Some(child_of) => {
+            if let Ok(parent_global) = q_parent_global.get(child_of.parent()) {
+                GlobalTransform::from(world_transform).reparented_to(parent_global)
+            } else {
+                world_transform
+            }
+        }
+        None => world_transform,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn update_gizmos(
     q_window: Query<&Window, With<PrimaryWindow>>,
     q_gizmo_camera: Query<(&Camera, &GlobalTransform), With<GizmoCamera>>,
-    mut q_targets: Query<(Entity, &mut Transform, &mut GizmoTarget), Without<GizmoCamera>>,
-    mut drag_started: EventReader<GizmoDragStarted>,
-    mut dragging: EventReader<GizmoDragging>,
+    mut q_targets: Query<
+        (
+            Entity,
+            &mut Transform,
+            &GlobalTransform,
+            Option<&ChildOf>,
+            &mut GizmoTarget,
+        ),
+        Without<GizmoCamera>,
+    >,
+    q_parent_global: Query<&GlobalTransform>,
+    mut drag_started: MessageReader<GizmoDragStarted>,
+    mut dragging: MessageReader<GizmoDragging>,
     gizmo_options: Res<GizmoOptions>,
     mut gizmo_storage: ResMut<GizmoStorage>,
     mut last_cursor_pos: Local<Vec2>,
@@ -442,7 +471,7 @@ fn update_gizmos(
 
     let projection_matrix = camera.clip_from_view();
 
-    let view_matrix = camera_transform.compute_matrix().inverse();
+    let view_matrix = camera_transform.to_matrix().inverse();
 
     let mut snap_angle = gizmo_options.snap_angle;
     let mut snap_distance = gizmo_options.snap_distance;
@@ -489,11 +518,22 @@ fn update_gizmos(
     };
 
     let mut target_entities: Vec<Entity> = vec![];
-    let mut target_transforms: Vec<Transform> = vec![];
+    let mut target_global_transforms: Vec<math::Transform> = vec![];
 
-    for (entity, mut target_transform, mut gizmo_target) in &mut q_targets {
+    for (entity, mut target_transform, global_transform, child_of, mut gizmo_target) in
+        &mut q_targets
+    {
         target_entities.push(entity);
-        target_transforms.push(*target_transform);
+
+        let (world_scale, world_rotation, world_translation) =
+            global_transform.to_scale_rotation_translation();
+        let world_gizmo_transform = math::Transform {
+            translation: world_translation.as_dvec3().into(),
+            rotation: world_rotation.as_dquat().into(),
+            scale: world_scale.as_dvec3().into(),
+        };
+
+        target_global_transforms.push(world_gizmo_transform);
 
         if gizmo_options.group_targets {
             gizmo_storage
@@ -516,14 +556,7 @@ fn update_gizmos(
         let gizmo = gizmo_storage.gizmos.entry(gizmo_uuid).or_default();
         gizmo.update_config(gizmo_config);
 
-        let gizmo_result = gizmo.update(
-            gizmo_interaction,
-            &[math::Transform {
-                translation: target_transform.translation.as_dvec3().into(),
-                rotation: target_transform.rotation.as_dquat().into(),
-                scale: target_transform.scale.as_dvec3().into(),
-            }],
-        );
+        let gizmo_result = gizmo.update(gizmo_interaction, &[world_gizmo_transform]);
 
         let is_focused = gizmo.is_focused();
 
@@ -536,9 +569,13 @@ fn update_gizmos(
                 continue;
             };
 
-            target_transform.translation = DVec3::from(result_transform.translation).as_vec3();
-            target_transform.rotation = DQuat::from(result_transform.rotation).as_quat();
-            target_transform.scale = DVec3::from(result_transform.scale).as_vec3();
+            let new_world = Transform {
+                translation: DVec3::from(result_transform.translation).as_vec3(),
+                rotation: DQuat::from(result_transform.rotation).as_quat(),
+                scale: DVec3::from(result_transform.scale).as_vec3(),
+            };
+
+            *target_transform = world_to_local(new_world, child_of, &q_parent_global);
         }
 
         gizmo_target.latest_result = gizmo_result.map(|(result, _)| result);
@@ -548,22 +585,13 @@ fn update_gizmos(
         let gizmo = gizmo_storage.gizmos.entry(GIZMO_GROUP_UUID).or_default();
         gizmo.update_config(gizmo_config);
 
-        let gizmo_result = gizmo.update(
-            gizmo_interaction,
-            target_transforms
-                .iter()
-                .map(|transform| transform_gizmo::math::Transform {
-                    translation: transform.translation.as_dvec3().into(),
-                    rotation: transform.rotation.as_dquat().into(),
-                    scale: transform.scale.as_dvec3().into(),
-                })
-                .collect::<Vec<_>>()
-                .as_slice(),
-        );
+        let gizmo_result = gizmo.update(gizmo_interaction, target_global_transforms.as_slice());
 
         let is_focused = gizmo.is_focused();
 
-        for (i, (_, mut target_transform, mut gizmo_target)) in q_targets.iter_mut().enumerate() {
+        for (i, (_, mut target_transform, _, child_of, mut gizmo_target)) in
+            q_targets.iter_mut().enumerate()
+        {
             gizmo_target.is_active = gizmo_result.is_some();
             gizmo_target.is_focused = is_focused;
 
@@ -573,9 +601,13 @@ fn update_gizmos(
                     continue;
                 };
 
-                target_transform.translation = DVec3::from(result_transform.translation).as_vec3();
-                target_transform.rotation = DQuat::from(result_transform.rotation).as_quat();
-                target_transform.scale = DVec3::from(result_transform.scale).as_vec3();
+                let new_world = Transform {
+                    translation: DVec3::from(result_transform.translation).as_vec3(),
+                    rotation: DQuat::from(result_transform.rotation).as_quat(),
+                    scale: DVec3::from(result_transform.scale).as_vec3(),
+                };
+
+                *target_transform = world_to_local(new_world, child_of, &q_parent_global);
             }
 
             gizmo_target.latest_result = gizmo_result.as_ref().map(|(result, _)| *result);
