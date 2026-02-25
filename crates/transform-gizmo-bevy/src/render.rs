@@ -14,7 +14,7 @@ use bevy_mesh::VertexBufferLayout;
 use bevy_pbr::{MeshPipeline, MeshPipelineKey, SetMeshViewBindGroup};
 use bevy_platform::collections::HashMap;
 use bevy_reflect::{Reflect, TypePath};
-use bevy_render::extract_component::ExtractComponent;
+use bevy_render::extract_component::{ExtractComponent, ExtractComponentPlugin};
 use bevy_render::prelude::*;
 use bevy_render::render_asset::{
     PrepareAssetError, RenderAsset, RenderAssetPlugin, RenderAssets, prepare_assets,
@@ -40,6 +40,16 @@ use uuid::Uuid;
 
 use crate::GizmoCamera;
 
+impl ExtractComponent for GizmoCamera {
+    type QueryData = &'static GizmoCamera;
+    type QueryFilter = ();
+    type Out = GizmoCamera;
+
+    fn extract_component(_item: bevy_ecs::query::QueryItem<'_, '_, Self::QueryData>) -> Option<Self::Out> {
+        Some(GizmoCamera)
+    }
+}
+
 const GIZMO_SHADER_HANDLE: Handle<Shader> = uuid_handle!("e44be110-cb2b-4a8d-9c0c-965424e6a633");
 
 pub(crate) struct TransformGizmoRenderPlugin;
@@ -50,7 +60,8 @@ impl Plugin for TransformGizmoRenderPlugin {
 
         app.register_type::<DrawDataHandles>()
             .init_resource::<DrawDataHandles>()
-            .add_plugins(RenderAssetPlugin::<GizmoBuffers>::default());
+            .add_plugins(RenderAssetPlugin::<GizmoBuffers>::default())
+            .add_plugins(ExtractComponentPlugin::<GizmoCamera>::default());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -326,7 +337,7 @@ fn queue_transform_gizmos(
             Has<MotionVectorPrepass>,
             Has<DeferredPrepass>,
         ),
-    )>,
+    ), With<GizmoCamera>>,
     mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
 ) {
     let draw_function = draw_functions.read().get_id::<DrawGizmo>().unwrap();

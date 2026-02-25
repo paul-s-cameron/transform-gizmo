@@ -231,7 +231,7 @@ impl GizmoTarget {
 }
 
 /// Marker used to specify which camera to use for gizmos.
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct GizmoCamera;
 
 #[derive(Resource, Default)]
